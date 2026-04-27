@@ -35,6 +35,7 @@ import sys
 import tempfile
 import time
 import threading
+import subprocess
 from types import SimpleNamespace
 import uuid
 from typing import List, Dict, Any, Optional
@@ -107,6 +108,109 @@ from agent.trajectory import (
     save_trajectory as _save_trajectory_to_file,
 )
 from utils import atomic_json_write, env_var_enabled
+
+
+def _load_aif_memory_config() -> Dict[str, Any]:
+    """Read optional AIF memory settings from ~/.hermes/config.yaml.
+
+    This intentionally keeps AIF integration configuration small and
+    non-invasive. If config parsing fails, Hermes simply behaves as it did
+    before this hook existed.
+    """
+    config_path = Path(get_hermes_home()) / "config.yaml"
+    if not config_path.exists():
+        return {}
+
+    try:
+        import yaml
+
+        with config_path.open("r", encoding="utf-8") as handle:
+            config = yaml.safe_load(handle) or {}
+    except Exception as exc:
+        logger.debug("Unable to read AIF memory config from %s: %s", config_path, exc)
+        return {}
+
+    memory_config = config.get("memory", {})
+    return memory_config if isinstance(memory_config, dict) else {}
+
+
+def _load_aif_memory_context() -> str:
+    """Load structured Hermes memory from an AIF file, when configured.
+
+    The AIF CLI owns parsing, resolving, compaction, and protected timestamps.
+    Hermes only asks for a Hermes-optimized view and injects the resulting
+    context into the system prompt. On any error, the caller can fall back to
+    the built-in MEMORY.md / USER.md flow.
+    """
+    if env_var_enabled("HERMES_DISABLE_AIF_MEMORY", default=False):
+        return ""
+
+    memory_config = _load_aif_memory_config()
+
+    enabled = memory_config.get("aif_enabled", True)
+    if isinstance(enabled, str) and enabled.lower() in {"0", "false", "no", "off"}:
+        return ""
+    if enabled is False:
+        return ""
+
+    hermes_home = Path(get_hermes_home())
+    aif_path = (
+        os.environ.get("HERMES_AIF_MEMORY")
+        or memory_config.get("aif_path")
+        or str(hermes_home / "MEMORY.aif")
+    )
+    aif_cli_path = (
+        os.environ.get("AIF_CLI_PATH")
+        or memory_config.get("aif_cli_path")
+        or "/mnt/c/Users/basbe/Desktop/aif/target/release/aif.exe"
+    )
+
+    if not aif_path:
+        return ""
+
+    aif_file = Path(str(aif_path)).expanduser()
+    if not aif_file.exists():
+        logger.debug("AIF memory file does not exist: %s", aif_file)
+        return ""
+
+    compact_mode = str(memory_config.get("compact_mode", "minified")).lower().strip()
+    args = [str(aif_cli_path), "hermes", "load", str(aif_file), "--resolve"]
+    if compact_mode in {"minified", "tiny"}:
+        args.append("--minified")
+    elif compact_mode == "compact":
+        args.append("--compact")
+
+    try:
+        result = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            timeout=8,
+            check=False,
+        )
+    except Exception as exc:
+        logger.warning("AIF memory load failed: %s", exc)
+        return ""
+
+    if result.returncode != 0:
+        logger.warning(
+            "AIF memory load exited with %s: %s",
+            result.returncode,
+            (result.stderr or result.stdout or "").strip(),
+        )
+        return ""
+
+    context = (result.stdout or "").strip()
+    if not context:
+        return ""
+
+    return (
+        "Hermes durable memory loaded from AIF.\n"
+        "Treat this as authoritative long-term memory. Preserve protected "
+        "timestamps by updating it through the aif CLI instead of editing "
+        "timestamp fields directly.\n\n"
+        f"{context}"
+    )
 
 
 
@@ -3177,7 +3281,10 @@ class AIAgent:
         if system_message is not None:
             prompt_parts.append(system_message)
 
-        if self._memory_store:
+        aif_memory_block = _load_aif_memory_context()
+        if aif_memory_block:
+            prompt_parts.append(aif_memory_block)
+        elif self._memory_store:
             if self._memory_enabled:
                 mem_block = self._memory_store.format_for_system_prompt("memory")
                 if mem_block:
